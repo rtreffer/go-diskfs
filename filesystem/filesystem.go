@@ -22,4 +22,6 @@ const (
 	TypeFat32 Type = iota
 	// TypeISO9660 is an iso filesystem
 	TypeISO9660
+	// TypeExt4 is an ext4 compatible filesystem
+	TypeExt4
 )
