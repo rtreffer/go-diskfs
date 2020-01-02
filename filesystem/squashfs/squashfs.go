@@ -240,7 +240,7 @@ func (fs *FileSystem) Mkdir(p string) error {
 func (fs *FileSystem) ReadDir(p string) ([]os.FileInfo, error) {
 	var fi []os.FileInfo
 	var err error
-	// non-workspace: read from iso9660
+	// non-workspace: read from squashfs
 	// workspace: read from regular filesystem
 	if fs.workspace != "" {
 		fullPath := path.Join(fs.workspace, p)

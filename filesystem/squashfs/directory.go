@@ -12,8 +12,13 @@ const (
 	dirNameMaxSize  = 256
 )
 
+// directory represents a contiguous directory on disk, composed of one header
+// and one or more entries under that header, i.e. directoryEntryRaw. An entire
+// directory may be composed of one or more of these "directory", depending
+// on how many headers it requires
 type directory struct {
-	entries []*directoryEntryRaw
+	inodeIndex uint32
+	entries    []*directoryEntryRaw
 }
 
 type directoryEntryRaw struct {

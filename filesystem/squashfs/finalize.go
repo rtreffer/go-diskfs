@@ -7,7 +7,6 @@ import (
 	"path"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/diskfs/go-diskfs/util"
 	"github.com/pkg/xattr"
@@ -53,72 +52,6 @@ type FinalizeOptions struct {
 	FileGID *uint32
 }
 
-// finalizeFileInfo is a file info useful for finalization
-// fulfills os.FileInfo
-//   Name() string       // base name of the file
-//   Size() int64        // length in bytes for regular files; system-dependent for others
-//   Mode() FileMode     // file mode bits
-//   ModTime() time.Time // modification time
-//   IsDir() bool        // abbreviation for Mode().IsDir()
-//   Sys() interface{}   // underlying data source (can return nil)
-type finalizeFileInfo struct {
-	path           string
-	target         string
-	location       uint32
-	recordSize     uint8
-	depth          int
-	name           string
-	size           int64
-	mode           os.FileMode
-	modTime        time.Time
-	isDir          bool
-	isRoot         bool
-	bytes          [][]byte
-	parent         *finalizeFileInfo
-	children       []*finalizeFileInfo
-	content        []byte
-	dataLocation   int64
-	fileType       fileType
-	inode          inode
-	xattrs         map[string]string
-	xAttrIndex     uint32
-	links          uint32
-	blocks         []*blockData
-	startBlock     uint64
-	fragmentBlock  uint32
-	fragmentOffset uint32
-	uid            uint32
-	gid            uint32
-}
-
-func (fi *finalizeFileInfo) Name() string {
-	return fi.name
-}
-func (fi *finalizeFileInfo) Size() int64 {
-	return fi.size
-}
-func (fi *finalizeFileInfo) Mode() os.FileMode {
-	return fi.mode
-}
-func (fi *finalizeFileInfo) ModTime() time.Time {
-	return fi.modTime
-}
-func (fi *finalizeFileInfo) IsDir() bool {
-	return fi.isDir
-}
-func (fi *finalizeFileInfo) Sys() interface{} {
-	return nil
-}
-
-// add depth to all children
-func (fi *finalizeFileInfo) addProperties(depth int) {
-	fi.depth = depth
-	for _, e := range fi.children {
-		e.parent = fi
-		e.addProperties(depth + 1)
-	}
-}
-
 // Finalize finalize a read-only filesystem by writing it out to a read-only format
 func (fs *FileSystem) Finalize(options FinalizeOptions) error {
 	if fs.workspace == "" {
@@ -159,18 +92,11 @@ func (fs *FileSystem) Finalize(options FinalizeOptions) error {
 		s.compression = options.Compression.flavour()
 	}
 
-	// build up a table of xattrs we can store later
-	xattrs := []map[string]string{}
-
-	// 3- build out file tree
-	fileList, dirList, err := walkTree(fs.Workspace())
+	// build out file and directory tree
+	fileList, err := walkTree(fs.Workspace())
 	if err != nil {
 		return fmt.Errorf("Error walking tree: %v", err)
 	}
-
-	// starting point
-	root := dirList["."]
-	root.addProperties(1)
 
 	// location holds where we are writing in our file
 	var location int64
@@ -212,34 +138,93 @@ func (fs *FileSystem) Finalize(options FinalizeOptions) error {
 	location += int64(fragsWritten)
 	sb.fragmentCount = uint32(fragmentBlocks)
 
+	// extract extended attributes
+	xattrs := extractXattrs(fileList)
+
+	// We have a chicken and an egg problem. On the one hand, inodes
+	// are written to the disk before the directories, so we need to know
+	// the size of the inode data. On the other hand, directory data must be known
+	// to create inodes. Further complicating matters is that the data in the
+	// directory inodes relies on having the directory data ready. Specifically,
+	// it includes:
+	// - index of the block in the directory table where the dir info starts. Note
+	//   that this is not just the directory *table* index, but the *block* index.
+	// - offset within the block in the directory table where the dir info starts.
+	//   Same notes as previous entry.
+	// - size of the directory table entries for this directory, all of it. Thus,
+	//   you have to have converted it all to bytes to get the information.
 	//
-	// save file xattrs
+	// On the other hand, the directory entry (and header) needs to know what
+	// inode number it points to in the entry.
 	//
-	for _, e := range fileList {
-		if len(e.xattrs) > 0 {
-			xattrs = append(xattrs, e.xattrs)
-			e.xAttrIndex = uint32(len(e.xattrs) - 1)
-		}
-	}
+	// The only possible way to do this is to run one, then the other, then
+	// modify them. Until you generate both, you just don't know.
+	//
+	// Something that eases it a bit is that the block index in directory inodes
+	// is from the start of the directory table, rather than start of archive.
+	//
+	// Order of execution:
+	// 1. Write the file (not directory) data and fragments to disk.
+	// 2. Create inodes for the files. We cannot write them yet because we need to
+	//    add the directory entries before compression.
+	// 3. Convert the directories to a directory table. And no, we cannot just
+	//    calculate it based on the directory size, since some directories have
+	//    one header, some have multiple, so the size of each directory, even
+	//    given the number of files, can change.
+	// 4. Create inodes for the directories.
+	// 5. Write inodes to disk.
+	// 6. Update the directory entries based on the inodes.
+	// 7. Write directory table to disk
+	//
+	// if storing the inodes and directory table entirely in memory becomes
+	// burdensome, use temporary scratch disk space to cache data in flight
 
 	//
-	// build inodes
+	// Build inodes for files. They are saved onto the fileList items themselves.
 	//
-	inodeCount, idtable, err := populateInodes(fileList, options)
+	// build up a table of uids/gids we can store later
+	idtable := map[uint32]uint16{}
+	// get the inodes in order as a slice
+	inodes, err := createInodes(fileList, idtable, options)
 	if err != nil {
-		return fmt.Errorf("Error populating inodes: %v", err)
+		return fmt.Errorf("error creating file inodes: %v", err)
 	}
-	sb.inodes = inodeCount
 
-	//
-	// create directory data
-	//
-	// this has to be stored, since inodes come before directories on disk,
-	//   but need directory positions to write inodes
-	//   if memory space becomes an issue, we will store it in a disk cache
-	directories, err := createDirectoryData(fileList, fs.workspace)
+	// convert the inodes to data, while keeping track of where each
+	// one is, so we can update the directory entries
+	inodeLocations := getInodeLocations(inodes)
 
-	// populate directory inodes
+	// create the directory table. We already have every inode and its position,
+	// so we do not need to dip back into the inodes. The only changes will be
+	// the block/offset references into the directory table, but those sizes do
+	// no change. However, we will have to break out the headers, so this is not
+	// completely finalized yet.
+	directories := createDirectories(fileList[0], inodeLocations)
+
+	// create the final version of the directory table by creating the headers
+	// and entries.
+	dirTable := optimizeDirectoryTable(directories)
+
+	if err := updateInodesFromDirectories(inodes, dirTable, directoryLocations); err != nil {
+		return fmt.Errorf("error updating inodes with final directory data: %v", err)
+	}
+
+	// write the inodes to the file
+	inodesWritten, err := writeInodes(inodes, f, fs.workspace, blocksize, compressor, location)
+	if err != nil {
+		return fmt.Errorf("Error writing inode data blocks: %v", err)
+	}
+	location += int64(inodesWritten)
+	// save how many inodes we have in the superblock
+	sb.inodes = uint32(len(inodes))
+
+	// write directory data
+	dirsWritten, err := writeDirectories(fileList, f, fs.workspace, blocksize, compressor, location)
+	if err != nil {
+		return fmt.Errorf("Error writing directory data blocks: %v", err)
+	}
+	location += int64(dirsWritten)
+
 	/*
 		The indexCount is used for indexed lookups.
 
@@ -343,14 +328,19 @@ func finalizeFragment(buf []byte, to util.File, toOffset int64, c Compressor) (i
 	return len(buf), nil
 }
 
-func walkTree(workspace string) ([]*finalizeFileInfo, map[string]*finalizeFileInfo, error) {
+// walkTree walks the tree and returns a slice of files and directories.
+// We do files and directories differently, since they need to be processed
+// differently on disk (file data and fragments vs directory table), and
+// because the inode data is different.
+// The first entry in the return always will be the root
+func walkTree(workspace string) ([]*finalizeFileInfo, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, nil, fmt.Errorf("Could not get pwd: %v", err)
 	}
 	// make everything relative to the workspace
 	os.Chdir(workspace)
-	dirList := make(map[string]*finalizeFileInfo)
+	dirMap := make(map[string]*finalizeFileInfo)
 	fileList := make([]*finalizeFileInfo, 0)
 	var entry *finalizeFileInfo
 	filepath.Walk(".", func(fp string, fi os.FileInfo, err error) error {
@@ -416,25 +406,26 @@ func walkTree(workspace string) ([]*finalizeFileInfo, map[string]*finalizeFileIn
 
 		// we will have to save it as its parent
 		parentDir := filepath.Dir(fp)
-		parentDirInfo := dirList[parentDir]
+		parentDirInfo := dirMap[parentDir]
 
 		if fi.IsDir() {
 			entry.children = make([]*finalizeFileInfo, 0, 20)
-			dirList[fp] = entry
+			dirMap[fp] = entry
 		} else {
 			// calculate blocks
 			entry.size = fi.Size()
 		}
 		if !isRoot {
 			parentDirInfo.children = append(parentDirInfo.children, entry)
-			dirList[parentDir] = parentDirInfo
+			dirMap[parentDir] = parentDirInfo
 		}
 		fileList = append(fileList, entry)
 		return nil
 	})
 	// reset the workspace
 	os.Chdir(cwd)
-	return fileList, dirList, nil
+
+	return fileList, nil
 }
 
 func getTableIdx(m map[uint32]uint16, index uint32) uint16 {
@@ -470,7 +461,7 @@ func writeFileDataBlocks(e *finalizeFileInfo, to util.File, ws string, startBloc
 	if raw%blocksize != 0 {
 		return 0, 0, fmt.Errorf("Copying file %s copied %d which is not a multiple of blocksize %d", e.Name(), raw, blocksize)
 	}
-	// save the information we need
+	// save the information we need for usage later in inodes to find the file data
 	e.dataLocation = location
 	e.blocks = blocks
 	e.startBlock = startBlock
@@ -585,11 +576,13 @@ func writeFragmentBlocks(fileList []*finalizeFileInfo, f util.File, ws string, b
 	return fragmentBlock, allWritten, nil
 }
 
-func populateInodes(fileList []*finalizeFileInfo, options FinalizeOptions) (uint32, map[uint32]uint16, error) {
-	// build up a table of uids/gids we can store later
-	idtable := map[uint32]uint16{}
+func createInodes(fileList []*finalizeFileInfo, idtable map[uint32]uint16, options FinalizeOptions) ([]inode, error) {
+	// get the inodes
+	inodes := make([]inode, 0)
+	var inodeIndex uint32
+
+	// need to keep track of directory position in directory table
 	// build our inodes for our files - must include all file types
-	var inodeCount uint32
 	for _, e := range fileList {
 		var (
 			in     inodeBody
@@ -639,7 +632,7 @@ func populateInodes(fileList []*finalizeFileInfo, options FinalizeOptions) (uint
 			*/
 			target, err := os.Readlink(e.path)
 			if err != nil {
-				return 0, idtable, fmt.Errorf("Unable to read target for symlink at %s: %v", e.path, err)
+				return inodes, fmt.Errorf("Unable to read target for symlink at %s: %v", e.path, err)
 			}
 			if len(e.xattrs) > 0 {
 				in = &extendedSymlink{
@@ -664,31 +657,26 @@ func populateInodes(fileList []*finalizeFileInfo, options FinalizeOptions) (uint
 			*/
 			if e.startBlock|uint32max != uint32max || e.Size()|int64(uint32max) != int64(uint32max) || len(e.xattrs) > 0 || e.links > 0 {
 				// use extendedFile inode
-				in = &extendedFile{
-					startBlock:         e.startBlock,
-					fileSize:           uint64(e.Size()),
-					blockSizes:         e.blocks,
-					links:              e.links,
-					fragmentBlockIndex: e.fragmentBlock,
-					fragmentOffset:     e.fragmentOffset,
-					xAttrIndex:         e.xAttrIndex,
+				in = &extendedDirectory{
+					startBlock: e.startBlock,
+					fileSize:   uint64(e.Size()),
+					links:      e.links,
+					xAttrIndex: e.xAttrIndex,
 				}
-				inodeT = inodeExtendedFile
+				inodeT = inodeExtendedDirectory
 			} else {
 				// use basicFile
-				in = &basicFile{
-					startBlock:         uint32(e.startBlock),
-					fileSize:           uint32(e.Size()),
-					blockSizes:         e.blocks,
-					fragmentBlockIndex: e.fragmentBlock,
-					fragmentOffset:     e.fragmentOffset,
+				in = &basicDirectory{
+					startBlock: uint32(e.startBlock),
+					links:      e.links,
+					fileSize:   uint32(e.Size()),
 				}
-				inodeT = inodeBasicFile
+				inodeT = inodeBasicDirectory
 			}
 		case fileBlock:
 			major, minor, err := getDeviceNumbers(e.path)
 			if err != nil {
-				return 0, idtable, fmt.Errorf("Unable to read major/minor device numbers for block device at %s: %v", e.path, err)
+				return inodes, fmt.Errorf("Unable to read major/minor device numbers for block device at %s: %v", e.path, err)
 			}
 			if len(e.xattrs) > 0 {
 				in = &extendedBlock{
@@ -713,7 +701,7 @@ func populateInodes(fileList []*finalizeFileInfo, options FinalizeOptions) (uint
 		case fileChar:
 			major, minor, err := getDeviceNumbers(e.path)
 			if err != nil {
-				return 0, idtable, fmt.Errorf("Unable to read major/minor device numbers for char device at %s: %v", e.path, err)
+				return inodes, fmt.Errorf("Unable to read major/minor device numbers for char device at %s: %v", e.path, err)
 			}
 			if len(e.xattrs) > 0 {
 				in = &extendedChar{
@@ -782,7 +770,6 @@ func populateInodes(fileList []*finalizeFileInfo, options FinalizeOptions) (uint
 		// get index to the uid and gid
 		uidIdx := getTableIdx(idtable, uid)
 		gidIdx := getTableIdx(idtable, gid)
-		inodeCount++
 		e.inode = &inodeImpl{
 			header: &inodeHeader{
 				inodeType: inodeT,
@@ -790,13 +777,15 @@ func populateInodes(fileList []*finalizeFileInfo, options FinalizeOptions) (uint
 				mode:      e.Mode(),
 				uidIdx:    uidIdx,
 				gidIdx:    gidIdx,
-				index:     inodeCount,
+				index:     inodeIndex,
 			},
 			body: in,
 		}
+		inodes = append(inodes, e.inode)
+		inodeIndex++
 	}
 
-	return inodeCount, idtable, nil
+	return inodes, nil
 }
 
 func createDirectoryData(fileList []*finalizeFileInfo, ws string) ([]byte, error) {
@@ -817,4 +806,154 @@ func createDirectoryData(fileList []*finalizeFileInfo, ws string) ([]byte, error
 	}
 
 	return directories, nil
+}
+
+// dirMapToList convert the map of directories to a list. The list should
+// be sorted with directories in any order, given that root "." is first,
+// and within a directory, sorted "asciibetically".
+// Typically, all children of a given directory have sequential inode numbers.
+// Our sorting should do this already. However, we could improve the algorithm.
+func dirMapToList(dirMap map[string]*finalizeFileInfo) []*finalizeFileInfo {
+	// add the depth to each one
+	root := dirMap["."]
+	root.addProperties(1)
+
+	list := make([]*finalizeFileInfo, 0, len(dirMap))
+	for _, v := range dirMap {
+		// we already did root
+		if !v.isRoot {
+			list = append(list, v)
+		}
+	}
+
+	return list
+}
+
+func extractXattrs(list []*finalizeFileInfo) []map[string]string {
+	xattrs := []map[string]string{}
+	for _, e := range list {
+		if len(e.xattrs) > 0 {
+			xattrs = append(xattrs, e.xattrs)
+			e.xAttrIndex = uint32(len(e.xattrs) - 1)
+		}
+	}
+	return xattrs
+}
+
+// blockPosition position of something inside a data or metadata section.
+// Includes the block number relative to the start, and the offset within
+// the block.
+type blockPosition struct {
+	block  uint32
+	offset uint16
+}
+
+// createDirectories take a list of finalizeFileInfo, turn it into a slice of
+// []directory.
+func createDirectories(e *finalizeFileInfo, inodeLocations []blockPosition) []*directory {
+	dirs := make([]*directory, 0)
+	entries := make([]*directoryEntryRaw, 0)
+	// go through each entry, and create a directory structure for it
+	// we will cycle through each directory, creating an entry for it
+	// and its children. A second pass will split into headers
+	for _, child := range e.children {
+		index := child.inode.index()
+		blockPos := inodeLocations[index]
+		entry := &directoryEntryRaw{
+			name:           child.Name(),
+			isSubdirectory: !child.isRoot,
+			startBlock:     blockPos.block,
+			offset:         blockPos.offset,
+			// we do not yet know the inodeNumber, which is an offset from the one in the header
+			// it will be filled in later
+		}
+		entries = append(entries, entry)
+	}
+	dir := &directory{
+		entries: entries,
+	}
+	dirs = append(dirs, dir)
+	// do children in a separate loop, so that we get all of the children lined up
+	for _, child := range e.children {
+		if child.IsDir() {
+			dirs = append(dirs, createDirectories(child, inodeLocations)...)
+		}
+	}
+	return dirs
+}
+
+// optimizeDirectoryTable convert a slice of directoryEntryRaw into a []directory
+// that can be written to disk
+func optimizeDirectoryTable(directories []*directory) []*directory {
+	// each directory is just a list of directoryEntryRaw; pull out the common
+	// elements for each into a header.
+	dirs := make([]*directory, 0)
+	return dirs
+}
+
+// getInodeLocations get a map of each inode index and where it will be on disk
+// i.e. the inode block, and the offset into the block
+func getInodeLocations(inodes []inode) []blockPosition {
+	// keeps our reference
+	positions := make([]blockPosition, 0, len(inodes))
+	var pos int64
+
+	// get block position for each inode
+	for _, i := range inodes {
+		b := i.toBytes()
+		positions = append(positions, blockPosition{
+			block:  uint32(pos / metadataBlockSize),
+			offset: uint16(pos % metadataBlockSize),
+		})
+		pos += int64(len(b))
+	}
+
+	return positions
+}
+
+// getDirectoryLocations get a map of each directory index and where it will be
+// on disk i.e. the directory block, and the offset into the block
+func getDirectoryLocations(directories []*directory) []blockPosition {
+	// keeps our reference
+	refTable := make([]blockPosition, 0, len(directories))
+	pos := 0
+
+	// get block position for each inode
+	for _, d := range directories {
+		// we start without knowing the inode block/number
+		// in any case, this func is just here to give us sizes and therefore
+		// locations inside the directory metadata blocks, not actual writable
+		// bytes
+		b := d.toBytes(0, 0)
+		refTable = append(refTable, blockPosition{
+			block:  pos / metadataBlockSize,
+			offset: pos % metadataBlockSize,
+		})
+		pos += b
+	}
+
+	return refTable
+}
+
+// updateInodesFromDirectories update the blockPosition for each directory
+// inode.
+func updateInodesFromDirectories(inodes []inode, dirTable []*directory, dirLocations []blockPosition) error {
+	// go through each directory, find its inode, and update it with the
+	// correct block and offset
+	for i, d := range dirTable {
+		index := d.inodeIndex
+		in := inodes[index]
+		switch in.(type) {
+		case basicDirectory:
+			dir := in.(basicDirectory)
+			dir.startBlock = dirLocations[i].block
+			dir.offset = dirLocations[i].offset
+		case extendedDirectory:
+			dir := in.(extendedDirectory)
+			dir.startBlock = dirLocations[i].block
+			dir.offset = dirLocations[i].offset
+		default:
+			return fmt.Errorf("inode at index %d from directory at index %d was unexpected type", index, i)
+		}
+	}
 }

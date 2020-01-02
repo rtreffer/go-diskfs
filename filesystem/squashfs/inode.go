@@ -51,6 +51,7 @@ type inode interface {
 	equal(inode) bool
 	Size() int64
 	inodeType() inodeType
+	index() uint32
 	getDirectoryEntries(string, *hashedData, *hashedData, []uint32, *xAttrTable, int) ([]*directoryEntry, error)
 }
 type inodeImpl struct {
@@ -78,6 +79,9 @@ func (i *inodeImpl) toBytes() []byte {
 }
 func (i *inodeImpl) inodeType() inodeType {
 	return i.header.inodeType
+}
+func (i *inodeImpl) index() uint32 {
+	return i.header.index
 }
 
 // Size return the size of the item reflected by this inode, if it supports it
